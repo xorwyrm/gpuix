@@ -36,6 +36,14 @@ GPUI (`downstream/zed`):
 - Hover listeners, hover styles and cursors count an element as hovered
   while the mouse is over one of its descendants, as CSS does. A blocking
   overlay inside a hovered card no longer un-hovers the card.
+- `gpui::grain(light, dark, cell, sparkle)` fills a quad with fine noise,
+  as on frosted glass or paper, anchored to the quad so it moves with it.
+- `Window::paint_inner_glows` paints soft light inside an element: a blurred
+  rounded rect clipped to the element's own shape, for surfaces that seem lit
+  from within.
+- `Window::paint_outer_shadows` paints drop shadows that stop at the
+  element's edge, as CSS `box-shadow` does, so they don't show through a
+  translucent element.
 
 GPUIX:
 

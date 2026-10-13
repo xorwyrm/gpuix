@@ -1,0 +1,473 @@
+diff --git a/crates/gpui/src/color.rs b/crates/gpui/src/color.rs
+--- a/crates/gpui/src/color.rs
++++ b/crates/gpui/src/color.rs
+@@ -747,6 +747,7 @@
+     LinearGradient = 1,
+     PatternSlash = 2,
+     Checkerboard = 3,
++    Grain = 4,
+ }
+ 
+ /// A color space for color interpolation.
+@@ -805,6 +806,11 @@
+                 "Checkerboard({:?}, {})",
+                 self.solid, self.gradient_angle_or_pattern_height
+             ),
++            BackgroundTag::Grain => write!(
++                f,
++                "Grain({:?}, {:?}, {})",
++                self.colors[0], self.colors[1], self.gradient_angle_or_pattern_height
++            ),
+         }
+     }
+ }
+@@ -847,6 +853,31 @@
+     }
+ }
+ 
++/// Creates a grain of fine noise, as on frosted glass or paper. Each cell, a
++/// square `cell` device pixels wide, takes a random value: above the middle it
++/// shows `light` and below it `dark`, at up to their full alpha, so most cells
++/// are faint. A `sparkle` fraction of cells (0 to 1) show `light` at four times
++/// its alpha instead, like the bright pits of frosted glass.
++///
++/// The grain is anchored to the quad's origin, so it moves with the quad.
++pub fn grain(light: impl Into<Hsla>, dark: impl Into<Hsla>, cell: f32, sparkle: f32) -> Background {
++    Background {
++        tag: BackgroundTag::Grain,
++        gradient_angle_or_pattern_height: cell.max(1.0),
++        colors: [
++            LinearColorStop {
++                color: light.into(),
++                percentage: sparkle.clamp(0.0, 1.0),
++            },
++            LinearColorStop {
++                color: dark.into(),
++                percentage: 0.0,
++            },
++        ],
++        ..Default::default()
++    }
++}
++
+ /// Creates a solid background color.
+ pub fn solid_background(color: impl Into<Hsla>) -> Background {
+     Background {
+@@ -943,6 +974,7 @@
+             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
+             BackgroundTag::PatternSlash => self.solid.is_transparent(),
+             BackgroundTag::Checkerboard => self.solid.is_transparent(),
++            BackgroundTag::Grain => self.colors.iter().all(|c| c.color.is_transparent()),
+         }
+     }
+ }
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -586,7 +586,9 @@
+     pub color: Hsla,
+     pub element_bounds: Bounds<ScaledPixels>,
+     pub element_corner_radii: Corners<ScaledPixels>,
+-    /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
++    /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside),
++    /// 2 = inner glow (the blurred rect itself, clipped to the element), 3 = outer shadow
++    /// (a drop shadow cut out where the element is).
+     pub inset: u32,
+     pub pad: u32, // align to 8 bytes
+ }
+diff --git a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -733,7 +733,7 @@
+                     | BackgroundTag::PatternSlash
+                     | BackgroundTag::Checkerboard => color.solid,
+ 
+-                    BackgroundTag::LinearGradient => color
++                    BackgroundTag::LinearGradient | BackgroundTag::Grain => color
+                         .colors
+                         .first()
+                         .map(|stop| stop.color)
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4175,6 +4175,78 @@
+         }
+     }
+ 
++    /// Paint drop shadows that stop at the element's edge, as a CSS `box-shadow` does.
++    /// [`Self::paint_drop_shadows`] also paints under the element, which shows through
++    /// one that is translucent. Inset shadows are skipped.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_outer_shadows(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        shadows: &[BoxShadow],
++    ) {
++        self.invalidator.debug_assert_paint();
++
++        let scale_factor = self.scale_factor();
++        let content_mask = self.snapped_content_mask();
++        let opacity = self.element_opacity();
++        let element_bounds = self.cover_bounds(bounds);
++        let element_corner_radii = corner_radii.scale(scale_factor);
++        for shadow in shadows {
++            if shadow.inset {
++                continue;
++            }
++            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
++            self.next_frame.scene.insert_primitive(Shadow {
++                order: 0,
++                blur_radius: shadow.blur_radius.scale(scale_factor),
++                bounds: self.cover_bounds(shadow_bounds),
++                content_mask,
++                corner_radii: corner_radii.scale(scale_factor),
++                color: shadow.color.opacity(opacity),
++                element_bounds,
++                element_corner_radii,
++                inset: 3,
++                pad: 0,
++            });
++        }
++    }
++
++    /// Paint soft light inside an element: each glow is a blurred rounded rect, as a
++    /// drop shadow is, but clipped to the element's own rounded shape instead of hidden
++    /// under it. Paint after the element's background, like inset shadows.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_inner_glows(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        glows: &[InnerGlow],
++    ) {
++        self.invalidator.debug_assert_paint();
++
++        let scale_factor = self.scale_factor();
++        let content_mask = self.snapped_content_mask();
++        let opacity = self.element_opacity();
++        let element_bounds = self.cover_bounds(bounds);
++        let element_corner_radii = corner_radii.scale(scale_factor);
++        for glow in glows {
++            self.next_frame.scene.insert_primitive(Shadow {
++                order: 0,
++                blur_radius: glow.blur_radius.scale(scale_factor),
++                bounds: self.cover_bounds(glow.bounds),
++                content_mask,
++                corner_radii: glow.corner_radii.scale(scale_factor),
++                color: glow.color.opacity(opacity),
++                element_bounds,
++                element_corner_radii,
++                inset: 2,
++                pad: 0,
++            });
++        }
++    }
++
+     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
+         let radii = &quad.corner_radii;
+         let widths = &quad.border_widths;
+@@ -8009,3 +8081,16 @@
+         assert_eq!(b_focus_count.get(), 1);
+     }
+ }
++
++/// Soft light inside an element, for [`Window::paint_inner_glows`].
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct InnerGlow {
++    /// Where the light is, before it is blurred.
++    pub bounds: Bounds<Pixels>,
++    /// The corners of `bounds`.
++    pub corner_radii: Corners<Pixels>,
++    /// How far the light spreads past `bounds`, as a shadow's blur radius does.
++    pub blur_radius: Pixels,
++    /// The light's color; its alpha is the strength at the middle.
++    pub color: Hsla,
++}
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -469,7 +469,7 @@
+   Shadow shadow = shadows[shadow_id];
+ 
+   Bounds_ScaledPixels bounds;
+-  if (shadow.inset != 0u) {
++  if (shadow.inset == 1u || shadow.inset == 2u) {
+     bounds = shadow.element_bounds;
+   } else {
+     // Leave room for the gaussian tail outside the shadow rect.
+@@ -542,10 +542,19 @@
+     }
+   }
+ 
+-  if (shadow.inset != 0u) {
+-    // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
+-    // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
++  if (shadow.inset == 1u) {
++    // The inset shadow is the complement of the (blurred) hole rect.
+     alpha = 1. - alpha;
++  }
++  if (shadow.inset == 3u) {
++    // An outer shadow stops at the element's edge, as a CSS box-shadow does, so it
++    // doesn't show through a translucent element.
++    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
++                                      shadow.element_corner_radii);
++    alpha *= saturate(0.5 + element_distance);
++  } else if (shadow.inset != 0u) {
++    // Inset shadows and inner glows are clipped to the element.
++    // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                       shadow.element_corner_radii);
+     alpha *= saturate(0.5 - element_distance);
+@@ -1158,6 +1167,10 @@
+   GradientColor out;
+   if (tag == 0 || tag == 2 || tag == 3) {
+     out.solid = hsla_to_rgba(solid);
++  } else if (tag == 4) {
++    // Grain: light and dark, used as they are.
++    out.color0 = hsla_to_rgba(color0);
++    out.color1 = hsla_to_rgba(color1);
+   } else if (tag == 1) {
+     out.color0 = hsla_to_rgba(color0);
+     out.color1 = hsla_to_rgba(color1);
+@@ -1180,6 +1193,18 @@
+     return float2x2(c, -s, s, c);
+ }
+ 
++// PCG, after Jarzynski and Olano, "Hash Functions for GPU Rendering" (2020).
++uint grain_hash(uint value) {
++  uint state = value * 747796405u + 2891336453u;
++  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
++  return (word >> 22u) ^ word;
++}
++
++// A value from 0 to 1 for a grain cell; `salt` gives an independent one.
++float grain_noise(uint2 cell, uint salt) {
++  return float(grain_hash(cell.x + grain_hash(cell.y + salt))) / 4294967295.0;
++}
++
+ float4 fill_color(Background background,
+                       float2 position,
+                       Bounds_ScaledPixels bounds,
+@@ -1276,6 +1301,22 @@
+         color.a *= saturate(should_be_colored);
+         break;
+     }
++    case 4: {
++        // grain: light above the middle, dark below, and a few bright cells
++        float size = background.gradient_angle_or_pattern_height;
++        float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
++        uint2 cell = uint2(max(relative_position / size, float2(0.0)));
++        float mottle = grain_noise(cell, 0u) * 2.0 - 1.0;
++        if (mottle >= 0.0) {
++          color = float4(color0.rgb, color0.a * mottle);
++        } else {
++          color = float4(color1.rgb, color1.a * -mottle);
++        }
++        if (grain_noise(cell, 2654435769u) < background.colors[0].percentage) {
++          color = float4(color0.rgb, min(1.0, color0.a * 4.0));
++        }
++        break;
++    }
+   }
+ 
+   return color;
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -135,6 +135,7 @@
+     // 1u is LinearGradient
+     // 2u is PatternSlash
+     // 3u is Checkerboard
++    // 4u is Grain
+     tag: u32,
+     // 0u is sRGB linear color
+     // 1u is Oklab color
+@@ -407,6 +408,10 @@
+ 
+     if (tag == 0u || tag == 2u || tag == 3u) {
+         result.solid = hsla_to_rgba(solid);
++    } else if (tag == 4u) {
++        // Grain: light and dark, used as they are.
++        result.color0 = hsla_to_rgba(colors[0].color);
++        result.color1 = hsla_to_rgba(colors[1].color);
+     } else if (tag == 1u) {
+         // The hsla_to_rgba is returns a linear sRGB color
+         result.color0 = hsla_to_rgba(colors[0].color);
+@@ -428,6 +433,18 @@
+     return result;
+ }
+ 
++// PCG, after Jarzynski and Olano, "Hash Functions for GPU Rendering" (2020).
++fn grain_hash(value: u32) -> u32 {
++    let state = value * 747796405u + 2891336453u;
++    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
++    return (word >> 22u) ^ word;
++}
++
++// A value from 0 to 1 for a grain cell; `salt` gives an independent one.
++fn grain_noise(cell: vec2<u32>, salt: u32) -> f32 {
++    return f32(grain_hash(cell.x + grain_hash(cell.y + salt))) / 4294967295.0;
++}
++
+ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
+     solid_color: vec4<f32>, color0: vec4<f32>, color1: vec4<f32>) -> vec4<f32> {
+     var background_color = vec4<f32>(0.0);
+@@ -509,6 +526,20 @@
+             background_color = solid_color;
+             background_color.a *= saturate(should_be_colored);
+         }
++        case 4u: {
++            // grain: light above the middle, dark below, and a few bright cells
++            let size = background.gradient_angle_or_pattern_height;
++            let cell = vec2<u32>(max((position - bounds.origin) / size, vec2<f32>(0.0)));
++            let mottle = grain_noise(cell, 0u) * 2.0 - 1.0;
++            if (mottle >= 0.0) {
++                background_color = vec4<f32>(color0.rgb, color0.a * mottle);
++            } else {
++                background_color = vec4<f32>(color1.rgb, color1.a * -mottle);
++            }
++            if (grain_noise(cell, 2654435769u) < background.colors[0].percentage) {
++                background_color = vec4<f32>(color0.rgb, min(1.0, color0.a * 4.0));
++            }
++        }
+     }
+ 
+     return background_color;
+@@ -955,11 +986,12 @@
+     corner_radii: Corners,
+     content_mask: Bounds,
+     color: Hsla,
+-    // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
++    // Only consulted when `inset != 0u`: the element's own bounds, used as a rounded-rect
+     // clip so the shadow never escapes the element.
+     element_bounds: Bounds,
+     element_corner_radii: Corners,
+-    // 0 = drop shadow, 1 = inset shadow.
++    // 0 = drop shadow, 1 = inset shadow, 2 = inner glow (the blurred rect, clipped),
++    // 3 = outer shadow (a drop shadow cut out under the element).
+     inset: u32,
+     pad: u32, // align to 8 bytes
+ }
+@@ -978,7 +1010,7 @@
+     var shadow = load_shadow(instance_id);
+ 
+     var geometry: Bounds;
+-    if (shadow.inset != 0u) {
++    if (shadow.inset == 1u || shadow.inset == 2u) {
+         geometry = shadow.element_bounds;
+     } else {
+         // Leave room for the gaussian tail outside the shadow rect.
+@@ -1033,10 +1065,19 @@
+         }
+     }
+ 
+-    if (shadow.inset != 0u) {
+-        // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
+-        // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
++    if (shadow.inset == 1u) {
++        // The inset shadow is the complement of the (blurred) hole rect.
+         alpha = 1.0 - alpha;
++    }
++    if (shadow.inset == 3u) {
++        // An outer shadow stops at the element's edge, as a CSS box-shadow does, so it
++        // doesn't show through a translucent element.
++        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
++                                        shadow.element_corner_radii);
++        alpha *= saturate(0.5 + element_distance);
++    } else if (shadow.inset != 0u) {
++        // Inset shadows and inner glows are clipped to the element.
++        // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+         let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                         shadow.element_corner_radii);
+         alpha *= saturate(0.5 - element_distance);
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -318,6 +318,10 @@
+     GradientColor output;
+     if (tag == 0 || tag == 2 || tag == 3) {
+         output.solid = hsla_to_rgba(solid);
++    } else if (tag == 4) {
++        // Grain: light and dark, used as they are.
++        output.color0 = hsla_to_rgba(colors[0].color);
++        output.color1 = hsla_to_rgba(colors[1].color);
+     } else if (tag == 1) {
+         output.color0 = hsla_to_rgba(colors[0].color);
+         output.color1 = hsla_to_rgba(colors[1].color);
+@@ -340,6 +344,18 @@
+     return float2x2(c, -s, s, c);
+ }
+ 
++// PCG, after Jarzynski and Olano, "Hash Functions for GPU Rendering" (2020).
++uint grain_hash(uint value) {
++    uint state = value * 747796405u + 2891336453u;
++    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
++    return (word >> 22u) ^ word;
++}
++
++// A value from 0 to 1 for a grain cell; `salt` gives an independent one.
++float grain_noise(uint2 cell, uint salt) {
++    return float(grain_hash(cell.x + grain_hash(cell.y + salt))) / 4294967295.0;
++}
++
+ float4 gradient_color(Background background,
+                       float2 position,
+                       Bounds bounds,
+@@ -436,6 +452,22 @@
+             color.a *= saturate(should_be_colored);
+             break;
+         }
++        case 4: {
++            // grain: light above the middle, dark below, and a few bright cells
++            float size = background.gradient_angle_or_pattern_height;
++            float2 relative_position = position - bounds.origin;
++            uint2 cell = uint2(max(relative_position / size, float2(0.0, 0.0)));
++            float mottle = grain_noise(cell, 0u) * 2.0 - 1.0;
++            if (mottle >= 0.0) {
++                color = float4(color0.rgb, color0.a * mottle);
++            } else {
++                color = float4(color1.rgb, color1.a * -mottle);
++            }
++            if (grain_noise(cell, 2654435769u) < background.colors[0].percentage) {
++                color = float4(color0.rgb, min(1.0, color0.a * 4.0));
++            }
++            break;
++        }
+     }
+ 
+     return color;
+@@ -887,7 +919,7 @@
+     Shadow shadow = shadows[shadow_id];
+ 
+     Bounds bounds;
+-    if (shadow.inset != 0u) {
++    if (shadow.inset == 1u || shadow.inset == 2u) {
+         bounds = shadow.element_bounds;
+     } else {
+         // Leave room for the gaussian tail outside the shadow rect.
+@@ -941,10 +973,19 @@
+         }
+     }
+ 
+-    if (shadow.inset != 0u) {
+-        // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
+-        // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
++    if (shadow.inset == 1u) {
++        // The inset shadow is the complement of the (blurred) hole rect.
+         alpha = 1.0 - alpha;
++    }
++    if (shadow.inset == 3u) {
++        // An outer shadow stops at the element's edge, as a CSS box-shadow does, so it
++        // doesn't show through a translucent element.
++        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
++                                          shadow.element_corner_radii);
++        alpha *= saturate(0.5 + element_distance);
++    } else if (shadow.inset != 0u) {
++        // Inset shadows and inner glows are clipped to the element.
++        // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+         float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                           shadow.element_corner_radii);
+         alpha *= saturate(0.5 - element_distance);
