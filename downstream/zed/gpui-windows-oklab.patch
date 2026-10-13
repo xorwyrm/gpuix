@@ -1,0 +1,22 @@
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -126,13 +126,16 @@
+ }
+ 
+ // Convert linear RGB to sRGB
++// A channel can come in a hair below zero: rounding in `hsla_to_rgba` for a fully
++// saturated color, or an Oklab mix just outside the gamut. `pow` of a negative is
++// NaN, which turns a whole gradient black, so clamp first.
+ float3 linear_to_srgb(float3 color) {
+-    return pow(color, float3(2.2, 2.2, 2.2));
++    return pow(max(color, 0.0), float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+ }
+ 
+ // Convert sRGB to linear RGB
+ float3 srgb_to_linear(float3 color) {
+-    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
++    return pow(max(color, 0.0), float3(2.2, 2.2, 2.2));
+ }
+ 
+ /// Hsla to linear RGBA conversion.

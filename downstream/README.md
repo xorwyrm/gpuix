@@ -31,6 +31,9 @@ GPUI (`downstream/zed`):
 - Windows: callbacks unregistered before a closed window is destroyed.
 - Windows: a window shown on purpose appears even when the launcher asked
   for a hidden first window, as `bun run` does.
+- Windows: Oklab gradients convert with the right transfer functions, as
+  upstream's #57543 does, and clamp a channel that rounds below zero, which
+  turned some fully saturated gradients black.
 - `Window::paint_glyph_unsnapped` places a glyph to a quarter pixel
   vertically, so text that moves slowly glides instead of stepping.
 - Hover listeners, hover styles and cursors count an element as hovered
