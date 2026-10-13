@@ -25,11 +25,11 @@ diff --git a/crates/gpui/src/color.rs b/crates/gpui/src/color.rs
      }
  }
  
-+/// Creates a grain of fine noise, as on frosted glass or paper. Each cell, a
-+/// square `cell` device pixels wide, takes a random value: above the middle it
-+/// shows `light` and below it `dark`, at up to their full alpha, so most cells
-+/// are faint. A `sparkle` fraction of cells (0 to 1) show `light` at four times
-+/// its alpha instead, like the bright pits of frosted glass.
++/// Creates a grain of fine noise, as on frosted glass or paper: soft mottling
++/// with features about `cell` device pixels across. Above the middle it shows
++/// `light` and below it `dark`, at up to their full alpha, so most of it is
++/// faint. A `sparkle` fraction of `cell`-wide squares (0 to 1) show `light` at
++/// four times its alpha instead, like the bright pits of frosted glass.
 +///
 +/// The grain is anchored to the quad's origin, so it moves with the quad.
 +pub fn grain(light: impl Into<Hsla>, dark: impl Into<Hsla>, cell: f32, sparkle: f32) -> Background {
@@ -232,7 +232,7 @@ diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders
    } else if (tag == 1) {
      out.color0 = hsla_to_rgba(color0);
      out.color1 = hsla_to_rgba(color1);
-@@ -1180,6 +1193,18 @@
+@@ -1180,6 +1193,31 @@
      return float2x2(c, -s, s, c);
  }
  
@@ -248,25 +248,41 @@ diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders
 +  return float(grain_hash(cell.x + grain_hash(cell.y + salt))) / 4294967295.0;
 +}
 +
++// Value noise: a random value at each cell corner, eased between them, so the
++// grain mottles softly rather than speckling pixel by pixel.
++float grain_value(float2 position, uint salt) {
++  float2 base = floor(position);
++  float2 t = position - base;
++  float2 ease = t * t * (3.0 - 2.0 * t);
++  uint2 corner = uint2(max(base, float2(0.0)));
++  float top = mix(grain_noise(corner, salt), grain_noise(corner + uint2(1, 0), salt), ease.x);
++  float bottom = mix(grain_noise(corner + uint2(0, 1), salt),
++                     grain_noise(corner + uint2(1, 1), salt), ease.x);
++  return mix(top, bottom, ease.y);
++}
++
  float4 fill_color(Background background,
                        float2 position,
                        Bounds_ScaledPixels bounds,
-@@ -1276,6 +1301,22 @@
+@@ -1276,6 +1314,25 @@
          color.a *= saturate(should_be_colored);
          break;
      }
 +    case 4: {
-+        // grain: light above the middle, dark below, and a few bright cells
++        // grain: two octaves of soft mottling, light above the middle and
++        // dark below, and a few bright cells
 +        float size = background.gradient_angle_or_pattern_height;
 +        float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
-+        uint2 cell = uint2(max(relative_position / size, float2(0.0)));
-+        float mottle = grain_noise(cell, 0u) * 2.0 - 1.0;
++        float2 grain_position = max(relative_position / size, float2(0.0));
++        float value = grain_value(grain_position, 0u) * 0.6
++            + grain_value(grain_position * 2.0, 1013904223u) * 0.4;
++        float mottle = clamp((value * 2.0 - 1.0) * 1.8, -1.0, 1.0);
 +        if (mottle >= 0.0) {
 +          color = float4(color0.rgb, color0.a * mottle);
 +        } else {
 +          color = float4(color1.rgb, color1.a * -mottle);
 +        }
-+        if (grain_noise(cell, 2654435769u) < background.colors[0].percentage) {
++        if (grain_noise(uint2(grain_position), 2654435769u) < background.colors[0].percentage) {
 +          color = float4(color0.rgb, min(1.0, color0.a * 4.0));
 +        }
 +        break;
@@ -296,7 +312,7 @@ diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wg
      } else if (tag == 1u) {
          // The hsla_to_rgba is returns a linear sRGB color
          result.color0 = hsla_to_rgba(colors[0].color);
-@@ -428,6 +433,18 @@
+@@ -428,6 +433,31 @@
      return result;
  }
  
@@ -312,31 +328,47 @@ diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wg
 +    return f32(grain_hash(cell.x + grain_hash(cell.y + salt))) / 4294967295.0;
 +}
 +
++// Value noise: a random value at each cell corner, eased between them, so the
++// grain mottles softly rather than speckling pixel by pixel.
++fn grain_value(position: vec2<f32>, salt: u32) -> f32 {
++    let base = floor(position);
++    let t = position - base;
++    let ease = t * t * (3.0 - 2.0 * t);
++    let corner = vec2<u32>(max(base, vec2<f32>(0.0)));
++    let top = mix(grain_noise(corner, salt), grain_noise(corner + vec2<u32>(1u, 0u), salt), ease.x);
++    let bottom = mix(grain_noise(corner + vec2<u32>(0u, 1u), salt),
++                     grain_noise(corner + vec2<u32>(1u, 1u), salt), ease.x);
++    return mix(top, bottom, ease.y);
++}
++
  fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
      solid_color: vec4<f32>, color0: vec4<f32>, color1: vec4<f32>) -> vec4<f32> {
      var background_color = vec4<f32>(0.0);
-@@ -509,6 +526,20 @@
+@@ -509,6 +539,23 @@
              background_color = solid_color;
              background_color.a *= saturate(should_be_colored);
          }
 +        case 4u: {
-+            // grain: light above the middle, dark below, and a few bright cells
++            // grain: two octaves of soft mottling, light above the middle and
++            // dark below, and a few bright cells
 +            let size = background.gradient_angle_or_pattern_height;
-+            let cell = vec2<u32>(max((position - bounds.origin) / size, vec2<f32>(0.0)));
-+            let mottle = grain_noise(cell, 0u) * 2.0 - 1.0;
++            let grain_position = max((position - bounds.origin) / size, vec2<f32>(0.0));
++            let value = grain_value(grain_position, 0u) * 0.6
++                + grain_value(grain_position * 2.0, 1013904223u) * 0.4;
++            let mottle = clamp((value * 2.0 - 1.0) * 1.8, -1.0, 1.0);
 +            if (mottle >= 0.0) {
 +                background_color = vec4<f32>(color0.rgb, color0.a * mottle);
 +            } else {
 +                background_color = vec4<f32>(color1.rgb, color1.a * -mottle);
 +            }
-+            if (grain_noise(cell, 2654435769u) < background.colors[0].percentage) {
++            if (grain_noise(vec2<u32>(grain_position), 2654435769u) < background.colors[0].percentage) {
 +                background_color = vec4<f32>(color0.rgb, min(1.0, color0.a * 4.0));
 +            }
 +        }
      }
  
      return background_color;
-@@ -955,11 +986,12 @@
+@@ -955,11 +1002,12 @@
      corner_radii: Corners,
      content_mask: Bounds,
      color: Hsla,
@@ -351,7 +383,7 @@ diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wg
      inset: u32,
      pad: u32, // align to 8 bytes
  }
-@@ -978,7 +1010,7 @@
+@@ -978,7 +1026,7 @@
      var shadow = load_shadow(instance_id);
  
      var geometry: Bounds;
@@ -360,7 +392,7 @@ diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wg
          geometry = shadow.element_bounds;
      } else {
          // Leave room for the gaussian tail outside the shadow rect.
-@@ -1033,10 +1065,19 @@
+@@ -1033,10 +1081,19 @@
          }
      }
  
@@ -397,7 +429,7 @@ diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shad
      } else if (tag == 1) {
          output.color0 = hsla_to_rgba(colors[0].color);
          output.color1 = hsla_to_rgba(colors[1].color);
-@@ -340,6 +344,18 @@
+@@ -340,6 +344,31 @@
      return float2x2(c, -s, s, c);
  }
  
@@ -413,25 +445,41 @@ diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shad
 +    return float(grain_hash(cell.x + grain_hash(cell.y + salt))) / 4294967295.0;
 +}
 +
++// Value noise: a random value at each cell corner, eased between them, so the
++// grain mottles softly rather than speckling pixel by pixel.
++float grain_value(float2 position, uint salt) {
++    float2 base = floor(position);
++    float2 t = position - base;
++    float2 ease = t * t * (3.0 - 2.0 * t);
++    uint2 corner = uint2(max(base, float2(0.0, 0.0)));
++    float top = lerp(grain_noise(corner, salt), grain_noise(corner + uint2(1, 0), salt), ease.x);
++    float bottom = lerp(grain_noise(corner + uint2(0, 1), salt),
++                        grain_noise(corner + uint2(1, 1), salt), ease.x);
++    return lerp(top, bottom, ease.y);
++}
++
  float4 gradient_color(Background background,
                        float2 position,
                        Bounds bounds,
-@@ -436,6 +452,22 @@
+@@ -436,6 +465,25 @@
              color.a *= saturate(should_be_colored);
              break;
          }
 +        case 4: {
-+            // grain: light above the middle, dark below, and a few bright cells
++            // grain: two octaves of soft mottling, light above the middle and
++            // dark below, and a few bright cells
 +            float size = background.gradient_angle_or_pattern_height;
 +            float2 relative_position = position - bounds.origin;
-+            uint2 cell = uint2(max(relative_position / size, float2(0.0, 0.0)));
-+            float mottle = grain_noise(cell, 0u) * 2.0 - 1.0;
++            float2 grain_position = max(relative_position / size, float2(0.0, 0.0));
++            float value = grain_value(grain_position, 0u) * 0.6
++                + grain_value(grain_position * 2.0, 1013904223u) * 0.4;
++            float mottle = clamp((value * 2.0 - 1.0) * 1.8, -1.0, 1.0);
 +            if (mottle >= 0.0) {
 +                color = float4(color0.rgb, color0.a * mottle);
 +            } else {
 +                color = float4(color1.rgb, color1.a * -mottle);
 +            }
-+            if (grain_noise(cell, 2654435769u) < background.colors[0].percentage) {
++            if (grain_noise(uint2(grain_position), 2654435769u) < background.colors[0].percentage) {
 +                color = float4(color0.rgb, min(1.0, color0.a * 4.0));
 +            }
 +            break;
@@ -439,7 +487,7 @@ diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shad
      }
  
      return color;
-@@ -887,7 +919,7 @@
+@@ -887,7 +935,7 @@
      Shadow shadow = shadows[shadow_id];
  
      Bounds bounds;
@@ -448,7 +496,7 @@ diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shad
          bounds = shadow.element_bounds;
      } else {
          // Leave room for the gaussian tail outside the shadow rect.
-@@ -941,10 +973,19 @@
+@@ -941,10 +989,19 @@
          }
      }
  
