@@ -1,0 +1,1008 @@
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -146,6 +146,7 @@
+     pub st_position: Point<f32>,
+     pub color: Background,
+     pub bounds: Bounds<ScaledPixels>,
++    pub content_mask: ContentMask<ScaledPixels>,
+ }
+ 
+ impl MetalRenderer {
+@@ -765,6 +766,7 @@
+                 st_position: v.st_position,
+                 color: path.color,
+                 bounds: path.bounds.intersect(&path.content_mask.bounds),
++                content_mask: path.content_mask,
+             }));
+         }
+         let vertex_instance_bindings = writer.write(&vertices)?;
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -28,6 +28,7 @@
+ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
+                Corners_ScaledPixels corner_radii);
+ float quad_sdf_impl(float2 center_to_point, float corner_radius);
++float mask_coverage(float2 position, ContentMask_ScaledPixels mask);
+ float gaussian(float x, float sigma);
+ float2 erf(float2 x);
+ float blur_along_x(float x, float y, float sigma, float corner,
+@@ -97,9 +98,17 @@
+       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+ }
+ 
++float4 quad_color(QuadFragmentInput input, constant Quad *quads);
++
+ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
+                               constant Quad *quads
+                               [[buffer(QuadInputIndex_Quads)]]) {
++  float4 color = quad_color(input, quads);
++  color.a *= mask_coverage(input.position.xy, quads[input.quad_id].content_mask);
++  return color;
++}
++
++float4 quad_color(QuadFragmentInput input, constant Quad *quads) {
+   Quad quad = quads[input.quad_id];
+   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
+     input.background_solid, input.background_color0, input.background_color1);
+@@ -560,6 +569,7 @@
+     alpha *= saturate(0.5 - element_distance);
+   }
+ 
++  alpha *= mask_coverage(input.position.xy, shadow.content_mask);
+   return input.color * float4(1., 1., 1., alpha);
+ }
+ 
+@@ -603,6 +613,7 @@
+   const float WAVE_HEIGHT_RATIO = 0.8;
+ 
+   Underline underline = underlines[input.underline_id];
++  float coverage = mask_coverage(input.position.xy, underline.content_mask);
+   if (underline.wavy) {
+     float half_thickness = underline.thickness * 0.5;
+     float2 origin =
+@@ -621,9 +632,9 @@
+     float distance_from_bottom_border = distance_in_pixels + half_thickness;
+     float alpha = saturate(
+         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
+-    return input.color * float4(1., 1., 1., alpha);
++    return input.color * float4(1., 1., 1., alpha * coverage);
+   } else {
+-    return input.color;
++    return input.color * float4(1., 1., 1., coverage);
+   }
+ }
+ 
+@@ -631,6 +642,7 @@
+   float4 position [[position]];
+   float2 tile_position;
+   float4 color [[flat]];
++  uint sprite_id [[flat]];
+   float4 clip_distance;
+ };
+ 
+@@ -638,6 +650,7 @@
+   float4 position [[position]];
+   float2 tile_position;
+   float4 color [[flat]];
++  uint sprite_id [[flat]];
+   float4 clip_distance;
+ };
+ 
+@@ -661,6 +674,7 @@
+       device_position,
+       tile_position,
+       color,
++      sprite_id,
+       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+ }
+ 
+@@ -677,7 +691,7 @@
+   float4 sample =
+       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+   float4 color = input.color;
+-  color.a *= sample.a;
++  color.a *= sample.a * mask_coverage(input.position.xy, sprites[input.sprite_id].content_mask);
+   return color;
+ }
+ 
+@@ -739,7 +753,8 @@
+     color.g = grayscale;
+     color.b = grayscale;
+   }
+-  color.a *= sprite.opacity * saturate(0.5 - distance);
++  color.a *= sprite.opacity * saturate(0.5 - distance) *
++             mask_coverage(input.position.xy, sprite.content_mask);
+   return color;
+ }
+ 
+@@ -820,6 +835,7 @@
+     gradient_color.color0,
+     gradient_color.color1
+   );
++  alpha *= mask_coverage(input.position.xy, vertices[input.vertex_id].content_mask);
+   return float4(color.rgb * color.a * alpha, alpha * color.a);
+ }
+ 
+@@ -1101,6 +1117,16 @@
+     }
+ }
+ 
++// How much of the pixel at `position` a content mask keeps. Its rect is clipped
++// by the clip distances, so only rounded corners are left to cut here.
++float mask_coverage(float2 position, ContentMask_ScaledPixels mask) {
++    Corners_ScaledPixels radii = mask.corner_radii;
++    if (max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left)) <= 0.0) {
++        return 1.0;
++    }
++    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, radii));
++}
++
+ // A standard gaussian function, used for weighting samples
+ float gaussian(float x, float sigma) {
+   return exp(-(x * x) / (2. * sigma * sigma)) / (sqrt(2. * M_PI_F) * sigma);
+diff --git a/crates/gpui/src/debug_overlay.rs b/crates/gpui/src/debug_overlay.rs
+--- a/crates/gpui/src/debug_overlay.rs
++++ b/crates/gpui/src/debug_overlay.rs
+@@ -141,6 +141,7 @@
+                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                 size: viewport,
+             },
++            ..Default::default()
+         };
+ 
+         scene.insert_primitive(solid_quad(
+diff --git a/crates/gpui/src/elements/list.rs b/crates/gpui/src/elements/list.rs
+--- a/crates/gpui/src/elements/list.rs
++++ b/crates/gpui/src/elements/list.rs
+@@ -1333,7 +1333,7 @@
+                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
+                 item_origin.y -= layout_response.scroll_top.offset_in_item;
+                 for item in &mut layout_response.item_layouts {
+-                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
++                    window.with_content_mask(Some(ContentMask::rect(bounds)), |window| {
+                         item.element.prepaint_at(item_origin, window, cx);
+                     });
+ 
+@@ -1728,7 +1728,7 @@
+             }
+         });
+ 
+-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
++        window.with_content_mask(Some(ContentMask::rect(bounds)), |window| {
+             for item in &mut prepaint.layout.item_layouts {
+                 item.element.paint(window, cx);
+             }
+diff --git a/crates/gpui/src/elements/surface.rs b/crates/gpui/src/elements/surface.rs
+--- a/crates/gpui/src/elements/surface.rs
++++ b/crates/gpui/src/elements/surface.rs
+@@ -208,6 +208,7 @@
+                         point(ScaledPixels(0.), ScaledPixels(0.)),
+                         size(ScaledPixels(64.), ScaledPixels(64.)),
+                     ),
++                    ..Default::default()
+                 },
+                 texture: Arc::clone(&texture),
+                 texture_size: size(DevicePixels(64), DevicePixels(64)),
+diff --git a/crates/gpui/src/elements/uniform_list.rs b/crates/gpui/src/elements/uniform_list.rs
+--- a/crates/gpui/src/elements/uniform_list.rs
++++ b/crates/gpui/src/elements/uniform_list.rs
+@@ -489,7 +489,7 @@
+                         (self.render_items)(visible_range.clone(), window, cx)
+                     };
+ 
+-                    let content_mask = ContentMask { bounds };
++                    let content_mask = ContentMask::rect(bounds);
+                     window.with_content_mask(Some(content_mask), |window| {
+                         for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
+                             let item_origin = padded_bounds.origin
+diff --git a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -663,11 +663,11 @@
+             _ => {
+                 let mut min = bounds.origin;
+                 let mut max = bounds.bottom_right();
+-
+-                if self
++                let bordered = self
+                     .border_color
+-                    .is_some_and(|color| !color.is_transparent())
+-                {
++                    .is_some_and(|color| !color.is_transparent());
++
++                if bordered {
+                     min.x += self.border_widths.left.to_pixels(rem_size);
+                     max.x -= self.border_widths.right.to_pixels(rem_size);
+                     min.y += self.border_widths.top.to_pixels(rem_size);
+@@ -690,11 +690,34 @@
+                         point(bounds.origin.x, min.y),
+                         point(bounds.bottom_right().x, max.y),
+                     ),
+-                    // both hidden
+-                    (false, false) => Bounds::from_corners(min, max),
++                    // both hidden: the corners clip round, as CSS does, along the inside of
++                    // any border
++                    (false, false) => {
++                        let mut radii = self
++                            .corner_radii
++                            .to_pixels(rem_size)
++                            .clamp_radii_for_quad_size(bounds.size);
++                        if bordered {
++                            let widths = self.border_widths.to_pixels(rem_size);
++                            let inner = |radius: Pixels, a: Pixels, b: Pixels| {
++                                (radius - a.max(b)).max(px(0.))
++                            };
++                            radii = Corners {
++                                top_left: inner(radii.top_left, widths.top, widths.left),
++                                top_right: inner(radii.top_right, widths.top, widths.right),
++                                bottom_right: inner(
++                                    radii.bottom_right,
++                                    widths.bottom,
++                                    widths.right,
++                                ),
++                                bottom_left: inner(radii.bottom_left, widths.bottom, widths.left),
++                            };
++                        }
++                        return Some(ContentMask::rounded(Bounds::from_corners(min, max), radii));
++                    }
+                 };
+ 
+-                Some(ContentMask { bounds })
++                Some(ContentMask::rect(bounds))
+             }
+         }
+     }
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1950,27 +1950,66 @@
+ }
+ 
+ /// Indicates which region of the window is visible. Content falling outside of this mask will not be
+-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
+-/// to leave room to support more complex shapes in the future.
++/// rendered: content must lie within `bounds` and, when any of `corner_radii` is set, within the
++/// rounded rectangle `rounded_bounds` with those radii, as CSS clips to an element's rounded corners.
+ #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+ #[repr(C)]
+ pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
+     /// The bounds
+     pub bounds: Bounds<P>,
++    /// The rounded rectangle content must also lie within. After a rectangular mask inside a
++    /// rounded one, it can reach past `bounds` and still round the corners they share.
++    pub rounded_bounds: Bounds<P>,
++    /// The radii of `rounded_bounds`' corners; all zero for a rectangular mask.
++    pub corner_radii: Corners<P>,
+ }
+ 
+ impl ContentMask<Pixels> {
++    /// A rectangular content mask.
++    pub fn rect(bounds: Bounds<Pixels>) -> Self {
++        ContentMask {
++            bounds,
++            ..Default::default()
++        }
++    }
++
++    /// A content mask with rounded corners.
++    pub fn rounded(bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) -> Self {
++        ContentMask {
++            bounds,
++            rounded_bounds: bounds,
++            corner_radii: corner_radii.clamp_radii_for_quad_size(bounds.size),
++        }
++    }
++
++    /// Whether any corner of the mask is rounded.
++    pub fn is_rounded(&self) -> bool {
++        self.corner_radii != Corners::default()
++    }
++
+     /// Scale the content mask's pixel units by the given scaling factor.
+     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
+         ContentMask {
+             bounds: self.bounds.scale(factor),
++            rounded_bounds: self.rounded_bounds.scale(factor),
++            corner_radii: self.corner_radii.scale(factor),
+         }
+     }
+ 
+-    /// Intersect the content mask with the given content mask.
++    /// Intersect the content mask with the given content mask. A mask holds one rounded
++    /// rectangle, so when both are rounded this one's corners are kept.
+     pub fn intersect(&self, other: &Self) -> Self {
+         let bounds = self.bounds.intersect(&other.bounds);
+-        ContentMask { bounds }
++        let rounded = if self.is_rounded() || !other.is_rounded() {
++            self
++        } else {
++            other
++        };
++        ContentMask {
++            bounds,
++            rounded_bounds: rounded.rounded_bounds,
++            corner_radii: rounded.corner_radii,
++        }
+     }
+ }
+ 
+@@ -2856,8 +2895,12 @@
+ 
+     #[inline]
+     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
++        let mask = self.content_mask();
++        let scale_factor = self.scale_factor();
+         ContentMask {
+-            bounds: self.cover_bounds(self.content_mask().bounds),
++            bounds: self.cover_bounds(mask.bounds),
++            rounded_bounds: mask.rounded_bounds.scale(scale_factor),
++            corner_radii: mask.corner_radii.scale(scale_factor),
+         }
+     }
+ 
+@@ -3844,15 +3887,12 @@
+     /// Obtain the current content mask. This method should only be called during element drawing.
+     pub fn content_mask(&self) -> ContentMask<Pixels> {
+         self.invalidator.debug_assert_paint_or_prepaint();
+-        self.content_mask_stack
+-            .last()
+-            .cloned()
+-            .unwrap_or_else(|| ContentMask {
+-                bounds: Bounds {
+-                    origin: Point::default(),
+-                    size: self.viewport_size,
+-                },
++        self.content_mask_stack.last().cloned().unwrap_or_else(|| {
++            ContentMask::rect(Bounds {
++                origin: Point::default(),
++                size: self.viewport_size,
+             })
++        })
+     }
+ 
+     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
+@@ -4356,6 +4396,7 @@
+                 self.next_frame.scene.insert_primitive(Quad {
+                     content_mask: ContentMask {
+                         bounds: content_mask_bounds,
++                        ..quad.content_mask
+                     },
+                     ..quad
+                 });
+diff --git a/crates/gpui_wgpu/src/shaders_subpixel.wgsl b/crates/gpui_wgpu/src/shaders_subpixel.wgsl
+--- a/crates/gpui_wgpu/src/shaders_subpixel.wgsl
++++ b/crates/gpui_wgpu/src/shaders_subpixel.wgsl
+@@ -4,7 +4,7 @@
+     order: u32,
+     pad: u32,
+     bounds: Bounds,
+-    content_mask: Bounds,
++    content_mask: ContentMask,
+     color: Hsla,
+     tile: AtlasTile,
+     transformation: TransformationMatrix,
+@@ -16,6 +16,7 @@
+     @location(0) tile_position: vec2<f32>,
+     @location(1) @interpolate(flat) color: vec4<f32>,
+     @location(3) clip_distances: vec4<f32>,
++    @location(4) @interpolate(flat) sprite_id: u32,
+ }
+ 
+ struct SubpixelSpriteFragmentOutput {
+@@ -32,7 +33,8 @@
+     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+     out.color = hsla_to_rgba(sprite.color);
+-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
++    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
++    out.sprite_id = instance_id;
+     return out;
+ }
+ 
+@@ -49,8 +51,10 @@
+         return SubpixelSpriteFragmentOutput(vec4<f32>(0.0), vec4<f32>(0.0));
+     }
+ 
++    // Dual-source blending weighs the foreground by `alpha`, so the mask cuts that.
++    let coverage = mask_coverage(input.position.xy, b_subpixel_sprites[input.sprite_id].content_mask);
+     var out = SubpixelSpriteFragmentOutput();
+     out.foreground = vec4<f32>(input.color.rgb, 1.0);
+-    out.alpha = vec4<f32>(input.color.a * alpha_corrected, 1.0);
++    out.alpha = vec4<f32>(input.color.a * alpha_corrected * coverage, 1.0);
+     return out;
+ }
+diff --git a/crates/gpui_wgpu/src/shaders_webgl.wgsl b/crates/gpui_wgpu/src/shaders_webgl.wgsl
+--- a/crates/gpui_wgpu/src/shaders_webgl.wgsl
++++ b/crates/gpui_wgpu/src/shaders_webgl.wgsl
+@@ -135,13 +135,17 @@
+     );
+ }
+ 
++fn read_content_mask(cursor: ptr<function, InstanceCursor>) -> ContentMask {
++    return ContentMask(read_bounds(cursor), read_bounds(cursor), read_corners(cursor));
++}
++
+ fn load_quad(instance_id: u32) -> Quad {
+-    var cursor = instance_cursor(instance_id * 40u);
++    var cursor = instance_cursor(instance_id * 48u);
+     return Quad(
+         read_word(&cursor),
+         read_word(&cursor),
+         read_bounds(&cursor),
+-        read_bounds(&cursor),
++        read_content_mask(&cursor),
+         read_background(&cursor),
+         read_hsla(&cursor),
+         read_corners(&cursor),
+@@ -150,13 +154,13 @@
+ }
+ 
+ fn load_shadow(instance_id: u32) -> Shadow {
+-    var cursor = instance_cursor(instance_id * 28u);
++    var cursor = instance_cursor(instance_id * 36u);
+     return Shadow(
+         read_word(&cursor),
+         read_f32(&cursor),
+         read_bounds(&cursor),
+         read_corners(&cursor),
+-        read_bounds(&cursor),
++        read_content_mask(&cursor),
+         read_hsla(&cursor),
+         read_bounds(&cursor),
+         read_corners(&cursor),
+@@ -166,12 +170,13 @@
+ }
+ 
+ fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
+-    var cursor = instance_cursor(vertex_id * 26u);
++    var cursor = instance_cursor(vertex_id * 38u);
+     return PathRasterizationVertex(
+         read_vec2_f32(&cursor),
+         read_vec2_f32(&cursor),
+         read_background(&cursor),
+         read_bounds(&cursor),
++        read_content_mask(&cursor),
+     );
+ }
+ 
+@@ -181,12 +186,12 @@
+ }
+ 
+ fn load_underline(instance_id: u32) -> Underline {
+-    var cursor = instance_cursor(instance_id * 16u);
++    var cursor = instance_cursor(instance_id * 24u);
+     return Underline(
+         read_word(&cursor),
+         read_word(&cursor),
+         read_bounds(&cursor),
+-        read_bounds(&cursor),
++        read_content_mask(&cursor),
+         read_hsla(&cursor),
+         read_f32(&cursor),
+         read_word(&cursor),
+@@ -194,12 +199,12 @@
+ }
+ 
+ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
+-    var cursor = instance_cursor(instance_id * 28u);
++    var cursor = instance_cursor(instance_id * 36u);
+     return MonochromeSprite(
+         read_word(&cursor),
+         read_word(&cursor),
+         read_bounds(&cursor),
+-        read_bounds(&cursor),
++        read_content_mask(&cursor),
+         read_hsla(&cursor),
+         read_atlas_tile(&cursor),
+         read_transformation(&cursor),
+@@ -207,14 +212,14 @@
+ }
+ 
+ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
+-    var cursor = instance_cursor(instance_id * 24u);
++    var cursor = instance_cursor(instance_id * 32u);
+     return PolychromeSprite(
+         read_word(&cursor),
+         read_word(&cursor),
+         read_word(&cursor),
+         read_f32(&cursor),
+         read_bounds(&cursor),
+-        read_bounds(&cursor),
++        read_content_mask(&cursor),
+         read_corners(&cursor),
+         read_atlas_tile(&cursor),
+     );
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -360,6 +360,37 @@
+ //
+ // See comments on similar code using `quad_sdf_impl` in `fs_quad` for
+ // explanation.
++// A content mask: the rect content is clipped to, and a rounded rect it must
++// also lie within. `rounded_bounds` can reach past `bounds` after a rect mask
++// inside a rounded one; all-zero radii make the mask a plain rect.
++struct ContentMask {
++    bounds: Bounds,
++    rounded_bounds: Bounds,
++    corner_radii: Corners,
++}
++
++// How much of the pixel at `position` a content mask keeps. Its rect is clipped
++// exactly elsewhere, so only rounded corners are left to cut here.
++fn mask_coverage(position: vec2<f32>, mask: ContentMask) -> f32 {
++    let radii = mask.corner_radii;
++    if (max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left)) <= 0.0) {
++        return 1.0;
++    }
++    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, radii));
++}
++
++// `color` as a pixel at `position` keeps it inside `mask`.
++fn clip_to_mask(color: vec4<f32>, position: vec2<f32>, mask: ContentMask) -> vec4<f32> {
++    let coverage = mask_coverage(position, mask);
++    if (coverage >= 1.0) {
++        return color;
++    }
++    if (globals.premultiplied_alpha != 0u) {
++        return color * coverage;
++    }
++    return vec4<f32>(color.rgb, color.a * coverage);
++}
++
+ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
+     let half_size = bounds.size / 2.0;
+     let center = bounds.origin + half_size;
+@@ -567,7 +598,7 @@
+     order: u32,
+     border_style: u32,
+     bounds: Bounds,
+-    content_mask: Bounds,
++    content_mask: ContentMask,
+     background: Background,
+     border_color: Hsla,
+     corner_radii: Corners,
+@@ -604,12 +635,17 @@
+     out.background_color1 = gradient.color1;
+     out.border_color = hsla_to_rgba(quad.border_color);
+     out.quad_id = instance_id;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
++    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
+     return out;
+ }
+ 
+ @fragment
+ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
++    let color = quad_color(input);
++    return clip_to_mask(color, input.position.xy, load_quad(input.quad_id).content_mask);
++}
++
++fn quad_color(input: QuadVarying) -> vec4<f32> {
+     // Alpha clip first, since we don't have `clip_distance`.
+     if (any(input.clip_distances < vec4<f32>(0.0))) {
+         return vec4<f32>(0.0);
+@@ -1000,7 +1036,7 @@
+     // The shadow rect for drop shadows; the "hole" rect for inset shadows.
+     bounds: Bounds,
+     corner_radii: Corners,
+-    content_mask: Bounds,
++    content_mask: ContentMask,
+     color: Hsla,
+     // Only consulted when `inset != 0u`: the element's own bounds, used as a rounded-rect
+     // clip so the shadow never escapes the element.
+@@ -1040,12 +1076,17 @@
+     out.position = to_device_position(unit_vertex, geometry);
+     out.color = hsla_to_rgba(shadow.color);
+     out.shadow_id = instance_id;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
++    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask.bounds);
+     return out;
+ }
+ 
+ @fragment
+ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
++    let color = shadow_color(input);
++    return clip_to_mask(color, input.position.xy, load_shadow(input.shadow_id).content_mask);
++}
++
++fn shadow_color(input: ShadowVarying) -> vec4<f32> {
+     // Alpha clip first, since we don't have `clip_distance`.
+     if (any(input.clip_distances < vec4<f32>(0.0))) {
+         return vec4<f32>(0.0);
+@@ -1109,6 +1150,7 @@
+     st_position: vec2<f32>,
+     color: Background,
+     bounds: Bounds,
++    content_mask: ContentMask,
+ }
+ 
+ 
+@@ -1163,6 +1205,7 @@
+     );
+     let color = gradient_color(background, input.position.xy, bounds,
+         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
++    alpha *= mask_coverage(input.position.xy, v.content_mask);
+     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
+ }
+ 
+@@ -1207,7 +1250,7 @@
+     order: u32,
+     pad: u32,
+     bounds: Bounds,
+-    content_mask: Bounds,
++    content_mask: ContentMask,
+     color: Hsla,
+     thickness: f32,
+     wavy: u32,
+@@ -1231,12 +1274,17 @@
+     out.position = to_device_position(unit_vertex, underline.bounds);
+     out.color = hsla_to_rgba(underline.color);
+     out.underline_id = instance_id;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
++    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask.bounds);
+     return out;
+ }
+ 
+ @fragment
+ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
++    let color = underline_color(input);
++    return clip_to_mask(color, input.position.xy, load_underline(input.underline_id).content_mask);
++}
++
++fn underline_color(input: UnderlineVarying) -> vec4<f32> {
+     const WAVE_FREQUENCY: f32 = 2.0;
+     const WAVE_HEIGHT_RATIO: f32 = 0.8;
+ 
+@@ -1273,7 +1321,7 @@
+     order: u32,
+     pad: u32,
+     bounds: Bounds,
+-    content_mask: Bounds,
++    content_mask: ContentMask,
+     color: Hsla,
+     tile: AtlasTile,
+     transformation: TransformationMatrix,
+@@ -1285,6 +1333,7 @@
+     @location(0) tile_position: vec2<f32>,
+     @location(1) @interpolate(flat) color: vec4<f32>,
+     @location(3) clip_distances: vec4<f32>,
++    @location(4) @interpolate(flat) sprite_id: u32,
+ }
+ 
+ @vertex
+@@ -1297,12 +1346,18 @@
+ 
+     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+     out.color = hsla_to_rgba(sprite.color);
+-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
++    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
++    out.sprite_id = instance_id;
+     return out;
+ }
+ 
+ @fragment
+ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
++    let color = mono_sprite_color(input);
++    return clip_to_mask(color, input.position.xy, load_mono_sprite(input.sprite_id).content_mask);
++}
++
++fn mono_sprite_color(input: MonoSpriteVarying) -> vec4<f32> {
+     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+ 
+@@ -1322,7 +1377,7 @@
+     grayscale: u32,
+     opacity: f32,
+     bounds: Bounds,
+-    content_mask: Bounds,
++    content_mask: ContentMask,
+     corner_radii: Corners,
+     tile: AtlasTile,
+ }
+@@ -1344,12 +1399,17 @@
+     out.position = to_device_position(unit_vertex, sprite.bounds);
+     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+     out.sprite_id = instance_id;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
++    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
+     return out;
+ }
+ 
+ @fragment
+ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
++    let color = poly_sprite_color(input);
++    return clip_to_mask(color, input.position.xy, load_poly_sprite(input.sprite_id).content_mask);
++}
++
++fn poly_sprite_color(input: PolySpriteVarying) -> vec4<f32> {
+     let sprite = load_poly_sprite(input.sprite_id);
+     var sample = textureSample(t_sprite, s_sprite, input.tile_position);
+     if (sprite.nearest_neighbor != 0u) {
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -2,8 +2,8 @@
+ use anyhow::{Context as _, Result};
+ use bytemuck::{Pod, Zeroable};
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
++    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point,
++    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+ };
+ use log::warn;
+ #[cfg(not(target_family = "wasm"))]
+@@ -107,6 +107,7 @@
+     st_position: Point<f32>,
+     color: Background,
+     bounds: Bounds<ScaledPixels>,
++    content_mask: ContentMask<ScaledPixels>,
+ }
+ 
+ pub struct WgpuSurfaceConfig {
+@@ -1781,6 +1782,7 @@
+                 st_position: v.st_position,
+                 color: path.color,
+                 bounds,
++                content_mask: path.content_mask,
+             }));
+         }
+ 
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -641,6 +641,7 @@
+                 st_position: v.st_position,
+                 color: path.color,
+                 bounds: path.clipped_bounds(),
++                content_mask: path.content_mask,
+             }));
+         }
+ 
+@@ -1267,6 +1268,7 @@
+     st_position: Point<f32>,
+     color: Background,
+     bounds: Bounds<ScaledPixels>,
++    content_mask: ContentMask<ScaledPixels>,
+ }
+ 
+ #[derive(Clone, Copy)]
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -317,6 +317,30 @@
+     return quad_sdf_impl(corner_center_to_point, corner_radius);
+ }
+ 
++// A content mask: the rect content is clipped to, and a rounded rect it must
++// also lie within. `rounded_bounds` can reach past `bounds` after a rect mask
++// inside a rounded one; all-zero radii make the mask a plain rect.
++struct ContentMask {
++    Bounds bounds;
++    Bounds rounded_bounds;
++    Corners corner_radii;
++};
++
++// How much of the pixel at `position` a content mask keeps. Its rect is clipped
++// by SV_ClipDistance, so only rounded corners are left to cut here.
++float mask_coverage(float2 position, ContentMask mask) {
++    Corners radii = mask.corner_radii;
++    if (max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left)) <= 0.0) {
++        return 1.0;
++    }
++    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, radii));
++}
++
++// `color`, in straight alpha, as a pixel at `position` keeps it inside `mask`.
++float4 clip_to_mask(float4 color, float2 position, ContentMask mask) {
++    return float4(color.rgb, color.a * mask_coverage(position, mask));
++}
++
+ GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
+     GradientColor output;
+     if (tag == 0 || tag == 2 || tag == 3) {
+@@ -553,7 +577,7 @@
+     uint order;
+     uint border_style;
+     Bounds bounds;
+-    Bounds content_mask;
++    ContentMask content_mask;
+     Background background;
+     Hsla border_color;
+     Corners corner_radii;
+@@ -593,7 +617,7 @@
+         quad.background.solid,
+         quad.background.colors
+     );
+-    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
++    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
+     float4 border_color = hsla_to_rgba(quad.border_color);
+ 
+     QuadVertexOutput output;
+@@ -607,7 +631,13 @@
+     return output;
+ }
+ 
++float4 quad_color(QuadFragmentInput input);
++
+ float4 quad_fragment(QuadFragmentInput input): SV_Target {
++    return clip_to_mask(quad_color(input), input.position.xy, quads[input.quad_id].content_mask);
++}
++
++float4 quad_color(QuadFragmentInput input) {
+     Quad quad = quads[input.quad_id];
+     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+     input.background_solid, input.background_color0, input.background_color1);
+@@ -909,7 +939,7 @@
+     float blur_radius;
+     Bounds bounds;
+     Corners corner_radii;
+-    Bounds content_mask;
++    ContentMask content_mask;
+     Hsla color;
+     Bounds element_bounds;
+     Corners element_corner_radii;
+@@ -949,7 +979,7 @@
+     }
+ 
+     float4 device_position = to_device_position(unit_vertex, bounds);
+-    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask);
++    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+     float4 color = hsla_to_rgba(shadow.color);
+ 
+     ShadowVertexOutput output;
+@@ -961,7 +991,13 @@
+     return output;
+ }
+ 
++float4 shadow_color(ShadowFragmentInput input);
++
+ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
++    return clip_to_mask(shadow_color(input), input.position.xy, shadows[input.shadow_id].content_mask);
++}
++
++float4 shadow_color(ShadowFragmentInput input) {
+     Shadow shadow = shadows[input.shadow_id];
+ 
+     float2 half_size = shadow.bounds.size / 2.;
+@@ -1024,6 +1060,7 @@
+     float2 st_position;
+     Background color;
+     Bounds bounds;
++    ContentMask content_mask;
+ };
+ 
+ StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
+@@ -1076,6 +1113,7 @@
+ 
+     float4 color = gradient_color(background, input.position.xy, bounds,
+         gradient.solid, gradient.color0, gradient.color1);
++    alpha *= mask_coverage(input.position.xy, sprite.content_mask);
+     return float4(color.rgb * color.a * alpha, alpha * color.a);
+ }
+ 
+@@ -1126,7 +1164,7 @@
+     uint order;
+     uint pad;
+     Bounds bounds;
+-    Bounds content_mask;
++    ContentMask content_mask;
+     Hsla color;
+     float thickness;
+     uint wavy;
+@@ -1153,7 +1191,7 @@
+     Underline underline = underlines[underline_id];
+     float4 device_position = to_device_position(unit_vertex, underline.bounds);
+     float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
+-                                                    underline.content_mask);
++                                                    underline.content_mask.bounds);
+     float4 color = hsla_to_rgba(underline.color);
+ 
+     UnderlineVertexOutput output;
+@@ -1164,7 +1202,13 @@
+     return output;
+ }
+ 
++float4 underline_color(UnderlineFragmentInput input);
++
+ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
++    return clip_to_mask(underline_color(input), input.position.xy, underlines[input.underline_id].content_mask);
++}
++
++float4 underline_color(UnderlineFragmentInput input) {
+     const float WAVE_FREQUENCY = 2.0;
+     const float WAVE_HEIGHT_RATIO = 0.8;
+ 
+@@ -1201,7 +1245,7 @@
+     uint order;
+     uint pad;
+     Bounds bounds;
+-    Bounds content_mask;
++    ContentMask content_mask;
+     Hsla color;
+     AtlasTile tile;
+     TransformationMatrix transformation;
+@@ -1211,6 +1255,7 @@
+     float4 position: SV_Position;
+     float2 tile_position: POSITION;
+     nointerpolation float4 color: COLOR;
++    nointerpolation uint sprite_id: TEXCOORD0;
+     float4 clip_distance: SV_ClipDistance;
+ };
+ 
+@@ -1218,6 +1263,7 @@
+     float4 position: SV_Position;
+     float2 tile_position: POSITION;
+     nointerpolation float4 color: COLOR;
++    nointerpolation uint sprite_id: TEXCOORD0;
+     float4 clip_distance: SV_ClipDistance;
+ };
+ 
+@@ -1229,7 +1275,7 @@
+     MonochromeSprite sprite = mono_sprites[sprite_id];
+     float4 device_position =
+         to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+-    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
++    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
+     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+     float4 color = hsla_to_rgba(sprite.color);
+ 
+@@ -1237,6 +1283,7 @@
+     output.position = device_position;
+     output.tile_position = tile_position;
+     output.color = color;
++    output.sprite_id = sprite_id;
+     output.clip_distance = clip_distance;
+     return output;
+ }
+@@ -1244,7 +1291,8 @@
+ float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
+     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
+     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+-    return float4(input.color.rgb, input.color.a * alpha_corrected);
++    float4 color = float4(input.color.rgb, input.color.a * alpha_corrected);
++    return clip_to_mask(color, input.position.xy, mono_sprites[input.sprite_id].content_mask);
+ }
+ 
+ MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+@@ -1258,9 +1306,11 @@
+     }
+     float3 alpha_corrected = apply_contrast_and_gamma_correction3(sample, input.color.rgb, subpixel_enhanced_contrast, gamma_ratios);
+ 
++    // Dual-source blending weighs the foreground by `alpha`, so the mask cuts that.
++    float coverage = mask_coverage(input.position.xy, mono_sprites[input.sprite_id].content_mask);
+     SubpixelSpriteFragmentOutput output;
+     output.foreground = float4(input.color.rgb, 1.0f);
+-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
++    output.alpha = float4(input.color.a * alpha_corrected * coverage, 1.0f);
+     return output;
+ }
+ 
+@@ -1276,7 +1326,7 @@
+     uint grayscale;
+     float opacity;
+     Bounds bounds;
+-    Bounds content_mask;
++    ContentMask content_mask;
+     Corners corner_radii;
+     AtlasTile tile;
+ };
+@@ -1302,7 +1352,7 @@
+     PolychromeSprite sprite = poly_sprites[sprite_id];
+     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
+     float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
+-                                                    sprite.content_mask);
++                                                    sprite.content_mask.bounds);
+     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+ 
+     PolychromeSpriteVertexOutput output;
+@@ -1330,6 +1380,6 @@
+         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
+         color = float4(grayscale, sample.a);
+     }
+-    color.a *= sprite.opacity * saturate(0.5 - distance);
++    color.a *= sprite.opacity * saturate(0.5 - distance) * mask_coverage(input.position.xy, sprite.content_mask);
+     return color;
+ }

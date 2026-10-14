@@ -47,6 +47,10 @@ GPUI (`downstream/zed`):
 - `Window::paint_outer_shadows` paints drop shadows that stop at the
   element's edge, as CSS `box-shadow` does, so they don't show through a
   translucent element.
+- Content masks can round their corners: a box with rounded corners that
+  hides its overflow clips its content to the curve, as CSS does. A
+  `ContentMask` carries `rounded_bounds` and `corner_radii` beside its
+  `bounds`; build a plain one with `ContentMask::rect(bounds)`.
 
 GPUIX:
 

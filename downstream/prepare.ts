@@ -28,6 +28,7 @@ const STACK = [
   "gpui-hover-descendants.patch",
   "gpui-glass.patch",
   "gpui-windows-oklab.patch",
+  "gpui-rounded-clip.patch",
 ];
 
 function run(args: string[], cwd: string) {
